@@ -5,102 +5,119 @@ using System.Threading;
 using Cysharp.Threading.Tasks;
 using UnityEngine;
 
-namespace QModules.PanelManager
+namespace PanelManager
 {
-    public class PanelManager : IPanelManager
+    public class PanelManager : IPanelManager, IDisposable
     {
-        public event Action<IPanel>? OnPanelShown;
-        public event Action<IPanel>? OnPanelClosed;
+        public event Action<IPanel> OnPanelShow = delegate { };
+        public event Action<IPanel> OnPanelHide = delegate { };
 
         public Canvas RootCanvas { get; private set; } = null!;
 
         private readonly IPanelFactory _panelFactory;
         private readonly Action<IPanel> _onPanelCreated;
-        private readonly Dictionary<Type, IPanel> _activePanels;
-        private readonly Dictionary<Type, CancellationTokenSource> _panelsTasks;
 
+        private readonly Dictionary<Type, IPanel> _activePanels = new();
+        private readonly Dictionary<Type, CancellationTokenSource> _panelsTasks = new();
+
+        private bool _isInitialized;
         private Canvas _nestedCanvas = null!;
 
         public PanelManager(IPanelFactory panelFactory, Action<IPanel>? onPanelCreated)
         {
             _panelFactory = panelFactory;
-            _onPanelCreated = onPanelCreated ?? (_ => { });
-            _activePanels = new Dictionary<Type, IPanel>();
-            _panelsTasks = new Dictionary<Type, CancellationTokenSource>();
+            _onPanelCreated = onPanelCreated ?? delegate { };
         }
 
         public void Initialize(Canvas rootCanvas)
         {
+            if (_isInitialized)
+            {
+                return;
+            }
+
+            _isInitialized = true;
             RootCanvas = rootCanvas;
             _nestedCanvas = PanelManagerUtils.CreateNestedCanvas(RootCanvas);
         }
 
-        public void Deinitialize()
+        public void Dispose()
         {
+            if (!_isInitialized)
+            {
+                return;
+            }
+
+            _isInitialized = false;
+
             var panels = _activePanels.Values.ToList();
 
             foreach (var panel in panels)
             {
-                Close(panel);
+                Debug.Log($"[{GetType().Name}] Close {panel.name}");
+
+                panel.Deactivate();
+                panel.Dispose();
+                _panelFactory.ReleaseInstance(panel);
+            }
+
+            foreach (var tokenSource in _panelsTasks.Values)
+            {
+                tokenSource.Cancel();
+                tokenSource.Dispose();
             }
 
             _activePanels.Clear();
             _panelsTasks.Clear();
 
-            _panelFactory.ReleaseAll();
-
             RootCanvas = null!;
+
+            OnPanelShow = delegate { };
+            OnPanelHide = delegate { };
         }
 
         #region IPanelManager
 
         public async UniTask<T> Show<T>(Transform? parent = null, int? sorting = null) where T : IPanel
         {
-            var view = await InstantiatePanel<T>(parent, sorting);
+            var panel = await InstantiatePanel<T>(parent, sorting);
 
-            if (view == null)
+            if (panel == null)
             {
-                Debug.LogError($"[{GetType().Name}] [{nameof(Show)}] Showing view of type {typeof(T).Name} cancelled");
+                Debug.LogError($"[{GetType().Name}] [Show] Showing view of type {typeof(T).Name} cancelled");
                 return default!;
             }
 
-            view.Activate();
-            OnPanelShown?.Invoke(view);
-            return view;
+            await panel.Show();
+
+            OnPanelShow(panel);
+            return panel;
         }
 
         public async UniTask<T> Show<T, TArgs>(TArgs args, Transform? parent = null, int? sorting = null)
             where T : IPanel<TArgs>
         {
-            var view = await InstantiatePanel<T>(parent, sorting);
+            var panel = await InstantiatePanel<T>(parent, sorting);
 
-            if (view == null)
+            if (panel == null)
             {
-                Debug.LogError($"[{GetType().Name}] [{nameof(Show)}] Showing view of type {typeof(T).Name} cancelled");
+                Debug.LogError($"[{GetType().Name}] [Show] Showing view of type {typeof(T).Name} cancelled");
                 return default!;
             }
 
-            view.Activate(args);
-            OnPanelShown?.Invoke(view);
-            return view;
+            await panel.Show(args);
+
+            OnPanelShow(panel);
+            return panel;
         }
 
-        public bool TryGet<T>(out T view) where T : IPanel
+        public async UniTask<T?> Get<T>() where T : IPanel
         {
-            if (!Has<T>())
-            {
-                view = default!;
-                return false;
-            }
+            var type = typeof(T);
 
-            view = Get<T>()!;
+            await WaitShow(type);
 
-            return true;
-        }
-
-        public T? Get<T>() where T : IPanel
-        {
-            if (_activePanels.TryGetValue(typeof(T), out var view))
+            if (_activePanels.TryGetValue(type, out var view))
             {
                 return (T) view;
             }
@@ -108,10 +125,17 @@ namespace QModules.PanelManager
             return default;
         }
 
-        public bool Has<T>(bool includeWait = false) where T : IPanel
+        public async UniTask<IPanel?> Get(Type type)
+        {
+            await WaitShow(type);
+
+            return _activePanels.GetValueOrDefault(type);
+        }
+
+        public bool Has<T>(bool includeInProcessShow = false) where T : IPanel
         {
             var type = typeof(T);
-            return Has(type, includeWait);
+            return Has(type, includeInProcessShow);
         }
 
         public bool Has(Type type, bool includeWait = false)
@@ -124,107 +148,67 @@ namespace QModules.PanelManager
             return _activePanels.ContainsKey(type);
         }
 
-        public bool Has(IPanel? view)
+        public UniTask TryClose<T>() where T : IPanel
         {
-            return view != null && _activePanels.ContainsKey(view.GetType());
+            var type = typeof(T);
+            return TryClose(type);
         }
 
-        public bool TryClose<T>() where T : IPanel
+        public async UniTask TryClose(Type type)
         {
-            if (!Has<T>())
-            {
-                return false;
-            }
-
-            Close<T>();
-            return true;
-        }
-
-        public bool TryClose(IPanel? view)
-        {
-            if (!Has(view))
-            {
-                return false;
-            }
-
-            Close(view);
-            return true;
-        }
-
-        public void Close<T>() where T : IPanel
-        {
-            var view = Get<T>();
-            if (view == null)
-            {
-                Debug.LogError($"[{nameof(PanelManager)}] [{nameof(Close)}] View doesn't exist: {typeof(T).Name}");
-                return;
-            }
-
-            Close(view);
-        }
-
-        public void Close(IPanel? view)
-        {
-            if (view == null)
-            {
-                Debug.LogError($"[{nameof(PanelManager)}] [{nameof(Close)}] View doesn't exist");
-                return;
-            }
-
-            if (!_activePanels.Remove(view.GetType()))
+            if (TryCancelPanelTask(type))
             {
                 return;
             }
 
-            Debug.Log($"[{nameof(PanelManager)}] [{nameof(Close)}] {view.name}");
-
-            view.Deactivate();
-            view.Dispose();
-
-            _panelFactory.ReleaseInstance(view);
-
-            OnPanelClosed?.Invoke(view);
+            var panel = await Get(type);
+            await TryClose(panel);
         }
 
-        public bool TryCancelViewShowingProcess<T>() where T : IPanel
+        public async UniTask TryClose(IPanel? panel)
         {
-            if (!_panelsTasks.TryGetValue(typeof(T), out var cancellationTokenSource))
-            {
-                return false;
-            }
-
-            cancellationTokenSource.Cancel();
-            return true;
-        }
-
-        public void OverrideSortingOrder<T>(int sortingOrder, int offset = 0) where T : IPanel
-        {
-            if (!TryGet(out T view))
+            if (panel == null)
             {
                 return;
             }
 
-            if (!view.gameObject.TryGetComponent<Canvas>(out var canvas))
+            var type = panel.GetType();
+
+            _activePanels.Remove(type);
+            Debug.Log($"[{GetType().Name}] [Close] {panel.name}");
+
+            await panel.Hide();
+            OnPanelHide(panel);
+            panel.Dispose();
+            _panelFactory.ReleaseInstance(panel);
+        }
+
+        public async UniTask OverrideSortingOrder<T>(int sortingOrder) where T : IPanel
+        {
+            var panel = await Get<T>();
+
+            if (panel == null || !panel.gameObject.TryGetComponent<Canvas>(out var canvas))
             {
                 return;
             }
 
             canvas.overrideSorting = true;
-            canvas.sortingOrder = sortingOrder + offset;
+            canvas.sortingOrder = sortingOrder;
         }
 
-        public void ResetSortingOrder<T>() where T : IPanel
+        public async UniTask ResetSortingOrder<T>() where T : IPanel
         {
-            if (TryGet(out T view))
+            var panel = await Get<T>();
+
+            if (panel == null || !panel.gameObject.TryGetComponent<Canvas>(out var canvas))
             {
-                if (view.gameObject.TryGetComponent<Canvas>(out var canvas))
-                {
-                    if (PanelManagerUtils.TryGetSortingOrder<T>(out var sortingOrder))
-                    {
-                        canvas.overrideSorting = true;
-                        canvas.sortingOrder = sortingOrder;
-                    }
-                }
+                return;
+            }
+
+            if (PanelManagerUtils.TryGetSortingOrder<T>(out var sortingOrder))
+            {
+                canvas.overrideSorting = true;
+                canvas.sortingOrder = sortingOrder;
             }
         }
 
@@ -241,56 +225,45 @@ namespace QModules.PanelManager
 
             if (_panelsTasks.ContainsKey(type))
             {
-                Debug.Log($"[{nameof(PanelManager)}] Show view already in progress: {type.Name}");
+                Debug.Log($"[{GetType().Name}] Show view already in progress: {type.Name}");
 
-                await UniTask.WaitWhile(() => _panelsTasks.ContainsKey(type) && !Has<T>());
+                var result = await Get<T>();
+                return result;
+            }
 
-                if (TryGet<T>(out var result))
-                {
-                    return result;
-                }
-            }
-            else
-            {
-                Debug.Log($"[{nameof(PanelManager)}] Show: {type.Name}");
-            }
+            Debug.Log($"[{GetType().Name}] Show: {type.Name}");
 
             var cancellation = new CancellationTokenSource();
+            _panelsTasks.Add(type, cancellation);
 
             if (!parent)
             {
                 parent = RootCanvas.transform;
             }
 
-            var task = InstantiatePanelInternal<T>(cancellation.Token, parent, sorting);
-
-            _panelsTasks.Add(type, cancellation);
-
-            var view = await task;
+            var panel = await InstantiatePanelInternal<T>(cancellation.Token, parent, sorting);
 
             _panelsTasks.Remove(type);
 
-            return view;
+            return panel;
         }
 
         private async UniTask<T> InstantiatePanelInternal<T>(
-            CancellationToken cancellation,
+            CancellationToken token,
             Transform? parent,
             int? sorting = null) where T : IPanel
         {
             var type = typeof(T);
 
-            var owner = parent == null
+            var owner = !parent
                 ? RootCanvas.transform
                 : parent;
 
             var panelName = type.Name;
 
-            var panelTask = _panelFactory.InstantiateAsync<T>(type.Name, owner);
+            var panel = await _panelFactory.InstantiateAsync<T>(type.Name, owner);
 
-            var panel = await panelTask;
-
-            if (cancellation.IsCancellationRequested)
+            if (token.IsCancellationRequested)
             {
                 _panelFactory.ReleaseInstance(panel);
                 return default!;
@@ -314,6 +287,31 @@ namespace QModules.PanelManager
             _onPanelCreated(panel);
 
             return panel;
+        }
+
+        private bool TryCancelPanelTask(Type type)
+        {
+            if (!_panelsTasks.TryGetValue(type, out var token))
+            {
+                return false;
+            }
+
+            token.Cancel();
+            token.Dispose();
+            _panelsTasks.Remove(type);
+            return true;
+        }
+
+        private async UniTask<bool> WaitShow(Type type)
+        {
+            if (!_panelsTasks.ContainsKey(type))
+            {
+                return false;
+            }
+
+            await UniTask.WaitWhile(() => _panelsTasks.ContainsKey(type));
+
+            return true;
         }
     }
 }

@@ -1,6 +1,6 @@
 {
-    "name": "QModules.PanelManager",
-    "rootNamespace": "QModules.PanelManager",
+    "name": "PanelManager",
+    "rootNamespace": "PanelManager",
     "references": [
         "GUID:f51ebe6a0ceec4240a699833d6309b23"
     ],

@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace QModules.PanelManager
+namespace PanelManager
 {
     [AttributeUsage(AttributeTargets.Class)]
     public sealed class PanelSortingAttribute : Attribute

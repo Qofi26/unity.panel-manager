@@ -2,7 +2,7 @@
 using UnityEngine;
 using UnityEngine.UI;
 
-namespace QModules.PanelManager
+namespace PanelManager
 {
     internal static class PanelManagerUtils
     {
